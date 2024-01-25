@@ -70,6 +70,8 @@ class CvxpyLayer(torch.nn.Module):
         """
         super(CvxpyLayer, self).__init__()
 
+        self.use_artificial_grads = False
+
         self.gp = gp
         if self.gp:
             if not problem.is_dgp(dpp=True):
@@ -117,6 +119,9 @@ class CvxpyLayer(torch.nn.Module):
             self.param_ids = [p.id for p in self.param_order]
         self.cone_dims = dims_to_solver_dict(data["dims"])
 
+    def set_artificial_grads_flag(self, is_true: bool):
+        self.use_artificial_grads = is_true
+
     def forward(self, *params, solver_args={}):
         """Solve problem (or a batch of problems) corresponding to `params`
 
@@ -138,6 +143,7 @@ class CvxpyLayer(torch.nn.Module):
                              'parameter; received %d tensors, expected %d' % (
                                  len(params), len(self.param_ids)))
         info = {}
+        info["use_artificial_grads"] = self.use_artificial_grads
         f = _CvxpyLayerFn(
             param_order=self.param_order,
             param_ids=self.param_ids,
@@ -289,34 +295,48 @@ def _CvxpyLayerFn(
                 xs, _, _, _, ctx.DT_batch = diffcp.solve_and_derivative_batch(
                     As, bs, cs, cone_dicts, **solver_args)
             except diffcp.SolverError as e:
-                print(
-                    "Please consider re-formulating your problem so that "
-                    "it is always solvable or increasing the number of "
-                    "solver iterations.")
-                raise e
+                # print(
+                #     "Please consider re-formulating your problem so that "
+                #     "it is always solvable or increasing the number of "
+                #     "solver iterations.")
+                if not info['use_artificial_grads']:
+                    raise e
+                else:
+                    xs = None
             info['solve_time'] = time.time() - start
 
             # extract solutions and append along batch dimension
             sol = [[] for _ in range(len(variables))]
-            for i in range(ctx.batch_size):
-                sltn_dict = compiler.split_solution(
-                    xs[i], active_vars=var_dict)
-                for j, v in enumerate(variables):
-                    sol[j].append(to_torch(
-                        sltn_dict[v.id], ctx.dtype, ctx.device).unsqueeze(0))
-            sol = [torch.cat(s, 0) for s in sol]
+            if xs is not None:
+                for i in range(ctx.batch_size):
+                    sltn_dict = compiler.split_solution(
+                        xs[i], active_vars=var_dict)
+                    for j, v in enumerate(variables):
+                        sol[j].append(to_torch(
+                            sltn_dict[v.id], ctx.dtype, ctx.device).unsqueeze(0))
+                sol = [torch.cat(s, 0) for s in sol]
 
-            if not ctx.batch:
-                sol = [s.squeeze(0) for s in sol]
+                if not ctx.batch:
+                    sol = [s.squeeze(0) for s in sol]
 
-            if gp:
-                sol = [torch.exp(s) for s in sol]
-                ctx.sol = sol
+                if gp:
+                    sol = [torch.exp(s) for s in sol]
+                    ctx.sol = sol
+
+            else:
+                for i, var in enumerate(variables):
+                    tensor_shape = []
+                    tensor_shape.append(batch_size)
+                    for dim in var.shape:
+                        tensor_shape.append(dim)
+                    sol[i] = torch.zeros(tensor_shape)
 
             return tuple(sol)
 
         @staticmethod
         def backward(ctx, *dvars):
+            #import pydevd
+            #pydevd.settrace(suspend=False, trace_only_current_thread=True)
             if gp:
                 # derivative of exponential recovery transformation
                 dvars = [dvar*s for dvar, s in zip(dvars, ctx.sol)]
